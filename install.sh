@@ -87,18 +87,27 @@ fetch_source(){
   STAGE="$(mktemp -d)"
   local src="${APP_SOURCE:-}"
   [ -n "$src" ] || die "Source URL not set. Go to Settings -> Set Source URL first."
+
   if [[ "$src" == local:* ]]; then
     local path="${src#local:}"
     [ -d "$path" ] || die "Local path not found: $path"
     bar 35 "Copying from local..."
-    rsync -a "$path"/ "$STAGE/extract/"
+    rsync -a "$path"/ "$STAGE/extract/" || die "Local copy failed"
   else
     bar 30 "Downloading artifact..."
     local zip="$STAGE/app.zip"
-    curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$zip" "$src"
+    if ! curl -fL --connect-timeout 20 --max-time 300 \
+        --retry 5 --retry-delay 2 --retry-connrefused \
+        -A "wa-installer" -o "$zip" "$src"; then
+      printf "\n"
+      die "Download failed from: $src"
+    fi
     bar 38 "Unpacking..."
     mkdir -p "$STAGE/extract"
-    unzip -q "$zip" -d "$STAGE/extract"
+    if ! unzip -q "$zip" -d "$STAGE/extract"; then
+      printf "\n"
+      die "Unzip failed (corrupt ZIP?)"
+    fi
     rm -f "$zip"
   fi
   bar 45 "Source ready"
