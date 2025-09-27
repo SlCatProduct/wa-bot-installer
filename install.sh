@@ -1,27 +1,40 @@
 #!/usr/bin/env bash
-# WhatsApp Bot Advanced - Interactive Installer / Manager
-# One-liner style (after you host this file on GitHub raw):
+# WhatsApp Bot Advanced - Interactive Installer / Manager (root-based, pretty UI)
+# One-liner (after you host this file on GitHub raw):
 #   bash <(curl -fsSL https://raw.githubusercontent.com/SlCatProduct/wa-bot-installer/main/install.sh)
 set -euo pipefail
 
 APP_NAME="whatsapp-bot-advanced"
-APP_DIR="/opt/${APP_NAME}"
+APP_DIR="/root/${APP_NAME}"           # install under /root
 APP_SERVICE="wa-bot.service"
 CONF_DIR="/etc/wa-bot"
 CONF_FILE="${CONF_DIR}/config.env"
 
 DEFAULT_PORT="3000"
 DEFAULT_TZ="Asia/Colombo"
-# Pre-set to your repo ZIP (direct raw link)
 DEFAULT_SOURCE_URL="https://raw.githubusercontent.com/SlCatProduct/wa-bot-installer/main/whatsapp-bot-advanced.zip"
+DEFAULT_LOG_TAIL="100"
 
+# ------------ UI helpers ------------
 green(){ printf "\033[32m%s\033[0m" "$*"; }
 yellow(){ printf "\033[33m%s\033[0m" "$*"; }
 red(){ printf "\033[31m%s\033[0m" "$*"; }
+blue(){ printf "\033[34m%s\033[0m" "$*"; }
+bold(){ printf "\033[1m%s\033[0m" "$*"; }
 ok(){ printf "%s %s\n" "$(green ✔)" "$*"; }
 warn(){ printf "%s %s\n" "$(yellow ⚠)" "$*"; }
 err(){ printf "%s %s\n" "$(red ✘)" "$*"; }
 die(){ err "$*"; exit 1; }
+
+# pretty progress bar
+bar(){
+  local pct=${1:-0} msg=${2:-""}
+  local width=40
+  local done=$(( pct * width / 100 ))
+  local left=$(( width - done ))
+  printf "\r\033[1m[%-*s%s]\033[0m %3d%%  %s" "$done" "$(printf '#%.0s' $(seq 1 $done))" "$(printf '.%.0s' $(seq 1 $left))" "$pct" "$msg"
+  [ "$pct" -ge 100 ] && printf "\n"
+}
 
 need_root(){ [ "$(id -u)" -eq 0 ] || die "Run as root (sudo)."; }
 
@@ -31,6 +44,7 @@ ensure_conf(){
   grep -q '^PORT=' "$CONF_FILE" 2>/dev/null || echo "PORT=${DEFAULT_PORT}" >> "$CONF_FILE"
   grep -q '^TZ=' "$CONF_FILE" 2>/dev/null || echo "TZ=${DEFAULT_TZ}" >> "$CONF_FILE"
   grep -q '^APP_SOURCE=' "$CONF_FILE" 2>/dev/null || echo "APP_SOURCE=${DEFAULT_SOURCE_URL}" >> "$CONF_FILE"
+  grep -q '^LOG_TAIL=' "$CONF_FILE" 2>/dev/null || echo "LOG_TAIL=${DEFAULT_LOG_TAIL}" >> "$CONF_FILE"
   set -a; source "$CONF_FILE"; set +a
 }
 
@@ -40,26 +54,28 @@ save_conf(){
 PORT=${PORT:-${DEFAULT_PORT}}
 TZ=${TZ:-${DEFAULT_TZ}}
 APP_SOURCE=${APP_SOURCE:-${DEFAULT_SOURCE_URL}}
+LOG_TAIL=${LOG_TAIL:-${DEFAULT_LOG_TAIL}}
 EOF
   ok "Saved settings -> ${CONF_FILE}"
 }
 
 ensure_tools(){
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -y
-  apt-get install -y curl unzip ca-certificates rsync >/dev/null
+  bar 5 "Updating apt cache..."; apt-get update -y >/dev/null
+  bar 10 "Installing base tools..."; apt-get install -y curl unzip ca-certificates rsync >/dev/null
+  bar 15 "Base tools ready"
 }
 
 install_docker(){
   if ! command -v docker >/dev/null 2>&1; then
-    warn "Installing Docker..."
-    curl -fsSL https://get.docker.com | sh
+    bar 18 "Installing Docker..."
+    curl -fsSL https://get.docker.com | sh >/dev/null
   fi
   if ! docker compose version >/dev/null 2>&1; then
-    warn "Installing docker compose plugin..."
-    apt-get update -y && apt-get install -y docker-compose-plugin
+    bar 22 "Installing docker compose plugin..."
+    apt-get update -y >/dev/null && apt-get install -y docker-compose-plugin >/dev/null
   fi
-  ok "Docker ready"
+  bar 25 "Docker ready"
 }
 
 get_cid(){ (cd "$APP_DIR" && docker compose ps -q app 2>/dev/null || true); }
@@ -74,17 +90,18 @@ fetch_source(){
   if [[ "$src" == local:* ]]; then
     local path="${src#local:}"
     [ -d "$path" ] || die "Local path not found: $path"
-    ok "Copying from local: $path"
+    bar 35 "Copying from local..."
     rsync -a "$path"/ "$STAGE/extract/"
   else
-    ok "Downloading artifact: $src"
+    bar 30 "Downloading artifact..."
     local zip="$STAGE/app.zip"
-    curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$zip" "$src" || die "Download failed"
-    ok "Unpacking..."
+    curl -fL --connect-timeout 15 --retry 3 --retry-delay 2 -o "$zip" "$src"
+    bar 38 "Unpacking..."
     mkdir -p "$STAGE/extract"
     unzip -q "$zip" -d "$STAGE/extract"
     rm -f "$zip"
   fi
+  bar 45 "Source ready"
 }
 
 detect_root_dir(){
@@ -100,24 +117,22 @@ detect_root_dir(){
 
 deploy_files(){
   local root="$1"
+  bar 48 "Deploying files..."
   rm -rf "${APP_DIR}.old" || true
   if [ -d "$APP_DIR" ]; then mv "$APP_DIR" "${APP_DIR}.old"; fi
   mkdir -p "$APP_DIR"
   rsync -a "$root"/ "$APP_DIR"/
 
-  # Bind mounts/types
   mkdir -p "$APP_DIR/backend/wa-auth"
   rm -rf "$APP_DIR/backend/data.sqlite" 2>/dev/null || true
   touch "$APP_DIR/backend/data.sqlite"
   chmod 666 "$APP_DIR/backend/data.sqlite"
   chmod -R 777 "$APP_DIR/backend/wa-auth"
 
-  # Optional: drop 'version:' line in compose to avoid warnings
   if grep -qE '^\s*version:' "$APP_DIR/docker-compose.yml" 2>/dev/null; then
     sed -i '/^\s*version:/d' "$APP_DIR/docker-compose.yml" || true
   fi
-
-  ok "Deployed to ${APP_DIR}"
+  bar 55 "Files deployed"
 }
 
 write_override(){
@@ -129,16 +144,18 @@ services:
     environment:
       - TZ=${TZ}
 EOF
-  ok "Compose override written (PORT=${PORT}, TZ=${TZ})"
+  bar 58 "Compose override written"
 }
 
 compose_up(){
-  (cd "$APP_DIR" && docker compose down || true)
-  (cd "$APP_DIR" && docker compose up --build -d)
-  ok "Container up"
+  bar 62 "Building container..."
+  (cd "$APP_DIR" && docker compose down >/dev/null 2>&1 || true)
+  (cd "$APP_DIR" && docker compose up --build -d >/dev/null)
+  bar 78 "Container started"
 }
 
 service_install(){
+  bar 82 "Enabling service..."
   cat > "/etc/systemd/system/${APP_SERVICE}" <<EOF
 [Unit]
 Description=WA Bot (Docker Compose)
@@ -154,26 +171,42 @@ TimeoutStartSec=0
 [Install]
 WantedBy=multi-user.target
 EOF
-  systemctl daemon-reload
-  systemctl enable "${APP_SERVICE}"
-  systemctl start  "${APP_SERVICE}"
-  ok "Service enabled (${APP_SERVICE})"
+  systemctl daemon-reload >/dev/null
+  systemctl enable "${APP_SERVICE}" >/dev/null
+  systemctl start  "${APP_SERVICE}" >/dev/null
+  bar 90 "Service active"
+}
+
+finish_msg(){
+  bar 100 "Done"
+  echo
+  ok "Open: http://$(curl -s ifconfig.me 2>/dev/null || echo '<SERVER-IP>'):${PORT}"
+  ok "API:  curl -sS http://127.0.0.1:${PORT}/api/status"
 }
 
 action_install(){
-  ensure_tools; install_docker; ensure_conf
+  clear
+  echo
+  echo "$(bold "Installing ${APP_NAME}")"
+  echo "----------------------------------------------"
+  ensure_conf; save_conf
+  ensure_tools
+  install_docker
   fetch_source
   local root; root="$(detect_root_dir "$STAGE/extract")"
   deploy_files "$root"
   write_override
   compose_up
   service_install
-  ok "Open: http://$(curl -s ifconfig.me 2>/dev/null || echo '<SERVER-IP>'):${PORT}"
-  ok "API:  curl -sS http://127.0.0.1:${PORT}/api/status"
+  finish_msg
 }
 
 action_update(){
-  ensure_tools; install_docker; ensure_conf
+  clear
+  echo
+  echo "$(bold "Updating ${APP_NAME}")"
+  echo "----------------------------------------------"
+  ensure_conf
   fetch_source
   local root; root="$(detect_root_dir "$STAGE/extract")"
   deploy_files "$root"
@@ -203,7 +236,8 @@ action_logs(){
   ensure_conf
   local cid; cid="$(get_cid)"
   [ -n "$cid" ] || die "No running container found."
-  docker logs -f "$cid"
+  echo "Showing last ${LOG_TAIL} lines (follow). Change default via: 12) Change Log Tail"
+  docker logs --tail="${LOG_TAIL}" -f "$cid"
 }
 
 action_restart(){
@@ -243,6 +277,15 @@ action_set_source(){
   ok "Source set."
 }
 
+action_change_log_tail(){
+  ensure_conf
+  read -rp "New default log tail lines [current: ${LOG_TAIL}]: " nl
+  case "${nl:-}" in
+    ''|*[!0-9]*) die "Please enter a positive integer";;
+    *) LOG_TAIL="$nl"; save_conf; ok "Log tail set to ${LOG_TAIL}";;
+  esac
+}
+
 action_backup(){
   ensure_conf
   local ts dest
@@ -264,11 +307,13 @@ action_restore(){
 menu(){
   clear
   echo "=============================="
-  echo " ${APP_NAME} Manager"
+  echo " $(bold "${APP_NAME} Manager")"
   echo "=============================="
   echo " Port      : ${PORT:-${DEFAULT_PORT}}"
   echo " Timezone  : ${TZ:-${DEFAULT_TZ}}"
   echo " Source    : ${APP_SOURCE:-<unset>}"
+  echo " Log Tail  : ${LOG_TAIL:-${DEFAULT_LOG_TAIL}} lines"
+  echo " App Dir   : ${APP_DIR}"
   echo "------------------------------"
   cat <<'M'
  1) Install
@@ -282,9 +327,10 @@ menu(){
  9) Set Source URL/Path
 10) Backup
 11) Restore
-12) Exit
+12) Change Log Tail
+13) Exit
 M
-  read -rp "Select [1-12]: " ans
+  read -rp "Select [1-13]: " ans
   case "${ans:-}" in
     1) action_install;;
     2) action_update;;
@@ -297,7 +343,8 @@ M
     9) action_set_source;;
     10) action_backup;;
     11) action_restore;;
-    12) exit 0;;
+    12) action_change_log_tail;;
+    13) exit 0;;
     *) echo "Invalid";;
   esac
   read -rp "Press Enter to continue..." _
@@ -306,6 +353,9 @@ M
 main(){
   need_root
   ensure_conf
+  # make sure default source is set to provided raw URL
+  APP_SOURCE="${APP_SOURCE:-$DEFAULT_SOURCE_URL}"
+  save_conf
   while true; do menu; done
 }
 
