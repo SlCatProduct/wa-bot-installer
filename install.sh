@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # WhatsApp Bot Advanced - Interactive Installer / Manager (root-based, pretty UI)
-# One-liner (after you host this file on GitHub raw):
+# One-liner idea (after you host this file on GitHub raw):
 #   bash <(curl -fsSL https://raw.githubusercontent.com/SlCatProduct/wa-bot-installer/main/install.sh)
 set -euo pipefail
 
@@ -13,27 +13,28 @@ CONF_FILE="${CONF_DIR}/config.env"
 DEFAULT_PORT="3000"
 DEFAULT_TZ="Asia/Colombo"
 DEFAULT_SOURCE_URL="https://raw.githubusercontent.com/SlCatProduct/wa-bot-installer/main/whatsapp-bot-advanced.zip"
-DEFAULT_LOG_TAIL="100"
+DEFAULT_LOG_TAIL="100"                # docker logs --tail=100 -f
 
 # ------------ UI helpers ------------
 green(){ printf "\033[32m%s\033[0m" "$*"; }
 yellow(){ printf "\033[33m%s\033[0m" "$*"; }
 red(){ printf "\033[31m%s\033[0m" "$*"; }
-blue(){ printf "\033[34m%s\033[0m" "$*"; }
 bold(){ printf "\033[1m%s\033[0m" "$*"; }
 ok(){ printf "%s %s\n" "$(green ✔)" "$*"; }
 warn(){ printf "%s %s\n" "$(yellow ⚠)" "$*"; }
 err(){ printf "%s %s\n" "$(red ✘)" "$*"; }
 die(){ err "$*"; exit 1; }
 
-# pretty progress bar
+# progress bar (single line)
 bar(){
   local pct=${1:-0} msg=${2:-""}
   local width=40
+  ((pct<0)) && pct=0
+  ((pct>100)) && pct=100
   local done=$(( pct * width / 100 ))
   local left=$(( width - done ))
   printf "\r\033[1m[%-*s%s]\033[0m %3d%%  %s" "$done" "$(printf '#%.0s' $(seq 1 $done))" "$(printf '.%.0s' $(seq 1 $left))" "$pct" "$msg"
-  [ "$pct" -ge 100 ] && printf "\n"
+  if [ "$pct" -ge 100 ]; then printf "\n"; fi
 }
 
 need_root(){ [ "$(id -u)" -eq 0 ] || die "Run as root (sudo)."; }
@@ -59,21 +60,53 @@ EOF
   ok "Saved settings -> ${CONF_FILE}"
 }
 
-ensure_tools(){
+# ---------- APT resilient update ----------
+apt_update_resilient() {
   export DEBIAN_FRONTEND=noninteractive
-  bar 5 "Updating apt cache..."; apt-get update -y >/dev/null
-  bar 10 "Installing base tools..."; apt-get install -y curl unzip ca-certificates rsync >/dev/null
+  mkdir -p /root/apt-disabled
+  local tries=2
+  for i in $(seq 1 $tries); do
+    bar 5 "Updating apt cache... (try $i/$tries)"
+    if apt-get update -o Acquire::Retries=3 -y >/dev/null 2>&1; then
+      bar 8 "APT cache OK"
+      return 0
+    fi
+    printf "\n"; warn "apt-get update failed (try $i). Diagnosing…"
+    # auto-disable common broken lists (cloudsmith/caddy/unstable)
+    local changed=0
+    while read -r f; do
+      [ -n "$f" ] || continue
+      warn "Disabling repo: $f"
+      mv "$f" "/root/apt-disabled/$(basename "$f").disabled" || true
+      changed=1
+    done < <(ls /etc/apt/sources.list.d/*.list 2>/dev/null | xargs -r grep -lEi 'cloudsmith|caddy|unstable|testing|bookworm .*ubuntu|ubuntu .*bookworm' || true)
+    apt-get clean || true
+    [ "$changed" = 1 ] || break
+  done
+  die "APT update failed. Check /root/apt-disabled for disabled repos and run again."
+}
+
+ensure_tools(){
+  apt_update_resilient
+  bar 10 "Installing base tools…"
+  if ! apt-get install -y curl unzip ca-certificates rsync >/dev/null 2>&1; then
+    printf "\n"; die "Failed to install base tools (curl/unzip/rsync)."
+  fi
   bar 15 "Base tools ready"
 }
 
 install_docker(){
   if ! command -v docker >/dev/null 2>&1; then
-    bar 18 "Installing Docker..."
-    curl -fsSL https://get.docker.com | sh >/dev/null
+    bar 18 "Installing Docker…"
+    if ! curl -fsSL https://get.docker.com | sh >/dev/null 2>&1; then
+      printf "\n"; die "Docker install failed."
+    fi
   fi
   if ! docker compose version >/dev/null 2>&1; then
-    bar 22 "Installing docker compose plugin..."
-    apt-get update -y >/dev/null && apt-get install -y docker-compose-plugin >/dev/null
+    bar 22 "Installing docker compose plugin…"
+    if ! apt-get install -y docker-compose-plugin >/dev/null 2>&1; then
+      printf "\n"; die "docker-compose-plugin install failed."
+    fi
   fi
   bar 25 "Docker ready"
 }
@@ -91,25 +124,29 @@ fetch_source(){
   if [[ "$src" == local:* ]]; then
     local path="${src#local:}"
     [ -d "$path" ] || die "Local path not found: $path"
-    bar 35 "Copying from local..."
-    rsync -a "$path"/ "$STAGE/extract/" || die "Local copy failed"
+    bar 35 "Copying from local…"
+    rsync -a "$path"/ "$STAGE/extract/" || { printf "\n"; die "Local copy failed"; }
   else
-    bar 30 "Downloading artifact..."
+    bar 30 "Downloading artifact…"
     local zip="$STAGE/app.zip"
     if ! curl -fL --connect-timeout 20 --max-time 300 \
         --retry 5 --retry-delay 2 --retry-connrefused \
         -A "wa-installer" -o "$zip" "$src"; then
-      printf "\n"
-      die "Download failed from: $src"
+      printf "\n"; die "Download failed from: $src"
     fi
-    bar 38 "Unpacking..."
+    bar 38 "Unpacking…"
     mkdir -p "$STAGE/extract"
     if ! unzip -q "$zip" -d "$STAGE/extract"; then
-      printf "\n"
-      die "Unzip failed (corrupt ZIP?)"
+      printf "\n"; die "Unzip failed (corrupt ZIP?)"
     fi
     rm -f "$zip"
   fi
+
+  # sanity check
+  if ! find "$STAGE/extract" -maxdepth 2 -name Dockerfile | grep -q .; then
+    printf "\n"; die "Artifact missing Dockerfile. Check APP_SOURCE."
+  fi
+
   bar 45 "Source ready"
 }
 
@@ -126,7 +163,7 @@ detect_root_dir(){
 
 deploy_files(){
   local root="$1"
-  bar 48 "Deploying files..."
+  bar 48 "Deploying files…"
   rm -rf "${APP_DIR}.old" || true
   if [ -d "$APP_DIR" ]; then mv "$APP_DIR" "${APP_DIR}.old"; fi
   mkdir -p "$APP_DIR"
@@ -138,6 +175,7 @@ deploy_files(){
   chmod 666 "$APP_DIR/backend/data.sqlite"
   chmod -R 777 "$APP_DIR/backend/wa-auth"
 
+  # Drop deprecated compose 'version:' line if present
   if grep -qE '^\s*version:' "$APP_DIR/docker-compose.yml" 2>/dev/null; then
     sed -i '/^\s*version:/d' "$APP_DIR/docker-compose.yml" || true
   fi
@@ -157,14 +195,14 @@ EOF
 }
 
 compose_up(){
-  bar 62 "Building container..."
+  bar 62 "Building container…"
   (cd "$APP_DIR" && docker compose down >/dev/null 2>&1 || true)
   (cd "$APP_DIR" && docker compose up --build -d >/dev/null)
   bar 78 "Container started"
 }
 
 service_install(){
-  bar 82 "Enabling service..."
+  bar 82 "Enabling service…"
   cat > "/etc/systemd/system/${APP_SERVICE}" <<EOF
 [Unit]
 Description=WA Bot (Docker Compose)
@@ -362,8 +400,9 @@ M
 main(){
   need_root
   ensure_conf
-  # make sure default source is set to provided raw URL
+  # ensure defaults are persisted the first time
   APP_SOURCE="${APP_SOURCE:-$DEFAULT_SOURCE_URL}"
+  LOG_TAIL="${LOG_TAIL:-$DEFAULT_LOG_TAIL}"
   save_conf
   while true; do menu; done
 }
